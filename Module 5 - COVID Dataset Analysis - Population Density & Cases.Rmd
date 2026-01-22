@@ -1,0 +1,359 @@
+---
+title: "COVID Dataset Analysis: Population Density & Cases"
+date: "`August 22nd, 2025`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+# 1. Define required packages
+pkgs <- c("knitr", "tidyverse", "lubridate", "ggplot2", "scales", "readr", "formatR")
+
+# 2. Install missing packages (corrected repo URL)
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cran.r-project.org")
+  }
+}
+
+# 3. Load packages
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(readr)
+library(formatR)  # For tidy code formatting
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 80)
+)
+```
+
+# Introduction
+
+This R markdown file examines if there is a correlation between population density and the number of cases of COVID across US counties. I tested the hypothesis that population density is a predictor of cases per 100,000 residents. This was a common prediction, especially at the beginning of the pandemic and it served as a bias I wanted to examine further.
+
+# Setting Up Required Packages
+
+```{r libraries}
+# Load required libraries
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(readr)
+```
+
+```{r helper-functions}
+# The below functions clean up the date formats which were giving errors
+clean_date <- function(x) {
+  x <- gsub("^X", "", x)
+  x <- gsub("\\.", "/", x)
+  x
+}
+```
+
+```{r load-data}
+# Using read_csv from the readr package for better https support
+base_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+file_names <- c(
+  "time_series_covid19_confirmed_US.csv",
+  "time_series_covid19_deaths_US.csv",
+  "time_series_covid19_confirmed_global.csv",
+  "time_series_covid19_deaths_global.csv"
+)
+
+# Downloading directly into R
+covid_confirmed_us <- read_csv(paste0(base_url, file_names[1]))
+covid_deaths_us    <- read_csv(paste0(base_url, file_names[2]))
+covid_confirmed_global <- read_csv(paste0(base_url, file_names[3]))
+covid_deaths_global    <- read_csv(paste0(base_url, file_names[4]))
+```
+
+# Preprocessing
+
+```{r clean-dates}
+# Clean date columns: Confirmed US Cases
+  # Note that I am using the helper functions defined previously to clean the date columns.
+date_cols_confirmed <- names(covid_confirmed_us)[12:ncol(covid_confirmed_us)]
+date_cols_confirmed_clean <- sapply(date_cols_confirmed, clean_date, USE.NAMES = FALSE)
+names(covid_confirmed_us)[12:ncol(covid_confirmed_us)] <- date_cols_confirmed_clean
+date_cols_final_confirmed <- names(covid_confirmed_us)[12:ncol(covid_confirmed_us)]
+
+# Clean date columns: US Deaths US
+  # Note that the population column is column #12 & dates start at 13)
+  # Also note that I am again using the helper functions defined previously to clean the date columns.
+date_cols_deaths <- names(covid_deaths_us)[13:ncol(covid_deaths_us)]
+date_cols_deaths_clean <- sapply(date_cols_deaths, clean_date, USE.NAMES = FALSE)
+names(covid_deaths_us)[13:ncol(covid_deaths_us)] <- date_cols_deaths_clean
+date_cols_final_deaths <- names(covid_deaths_us)[13:ncol(covid_deaths_us)]
+```
+
+```{r pivot-data}
+# Pivot confirmed cases
+covid_us_confirmed_long <- covid_confirmed_us %>%
+  select(UID, Admin2, Province_State, Country_Region, Lat, Long_, all_of(date_cols_final_confirmed)) %>%
+  pivot_longer(cols = all_of(date_cols_final_confirmed), names_to = "date", values_to = "confirmed_cases") %>%
+  mutate(date = as.Date(date, format = "%m/%d/%y"))
+
+# Pivot deaths data 
+  # Note that I am not pivoting the population
+covid_us_deaths_long <- covid_deaths_us %>%
+  select(UID, Admin2, Province_State, Country_Region, Lat, Long_, Population, all_of(date_cols_final_deaths)) %>%
+  pivot_longer(cols = all_of(date_cols_final_deaths), names_to = "date", values_to = "deaths") %>%
+  mutate(date = as.Date(date, format = "%m/%d/%y"))
+```
+
+```{r merge-data}
+# Merge confirmed & deaths
+covid_us_combined <- covid_us_confirmed_long %>%
+  left_join(covid_us_deaths_long %>% select(UID, date, deaths, Population), by = c("UID", "date")) %>%
+  arrange(UID, date)
+
+# Calculate new cases & deaths per day
+covid_us_combined <- covid_us_combined %>%
+  group_by(UID) %>%
+  mutate(
+    new_cases = confirmed_cases - lag(confirmed_cases, default = 0),
+    new_deaths = deaths - lag(deaths, default = 0),
+    new_cases = pmax(new_cases, 0),
+    new_deaths = pmax(new_deaths, 0)
+  ) %>%
+  ungroup()
+```
+
+# State-Level Analysis
+
+## Cases Over Time by State
+
+```{r state-analysis}
+# Calculate state population 
+  # I am taking the latest available
+state_pop <- covid_deaths_us %>%
+  group_by(Province_State) %>%
+  summarise(state_population = sum(Population, na.rm = TRUE), .groups = "drop")
+
+# Sum cases by state and date
+state_summary <- covid_us_combined %>%
+  filter(!is.na(Province_State), Province_State != "") %>%
+  group_by(Province_State, date) %>%
+  summarise(
+    total_cases = sum(confirmed_cases, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Join state population 
+  # Then calculate cases per 100k
+state_summary <- state_summary %>%
+  left_join(state_pop, by = "Province_State") %>%
+  mutate(
+    cases_per_100k = ifelse(state_population > 0, total_cases / state_population * 100000, NA_real_)
+  ) %>%
+  filter(date >= as.Date("2020-03-01") & date <= as.Date("2021-12-31"))
+
+# Calculate top 10 states
+  # Max per-capita.
+top_states <- state_summary %>%
+  group_by(Province_State) %>%
+  summarise(max_cases_per_100k = max(cases_per_100k, na.rm = TRUE), .groups = "drop") %>%
+  filter(is.finite(max_cases_per_100k)) %>%
+  top_n(10, max_cases_per_100k) %>%
+  pull(Province_State)
+```
+
+```{r plot-state-trends, fig.height=8}
+# Plot top 10 states of per-capita cases
+
+plot_cases_time <- state_summary %>%
+  filter(Province_State %in% top_states) %>%
+  ggplot(aes(x = date, y = cases_per_100k, color = Province_State)) +
+  geom_line(size = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  labs(
+    title = "Confirmed Cases per 100K Residents Over Time",
+    subtitle = "Top 10 States",
+    x = "Date",
+    y = "Total Cases (per 100K)",
+    color = "State"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(plot_cases_time)
+```
+
+# County-Level Analysis
+
+## Data Preparation
+
+```{r county-data-prep}
+# County summary
+latest_date <- max(covid_us_combined$date, na.rm = TRUE)
+cat("Latest date in dataset:", as.character(latest_date), "\n")
+
+county_summary <- covid_us_combined %>%
+  filter(date == latest_date) %>%
+  filter(!is.na(Population), !is.na(confirmed_cases), !is.na(deaths)) %>%
+  filter(Population > 0) %>%
+  mutate(
+    cases_per_capita = (confirmed_cases / Population) * 100000,
+    deaths_per_capita = (deaths / Population) * 100000
+  ) %>%
+  filter(!is.na(cases_per_capita), cases_per_capita > 0)
+
+# Print summary
+cat("Data summary (Counties):\n")
+cat(sprintf("Number of counties: %d\n", nrow(county_summary)))
+if(nrow(county_summary) > 0) {
+  cat(sprintf("Population range: %s to %s\n", 
+              format(min(county_summary$Population, na.rm = TRUE), big.mark = ","),
+              format(max(county_summary$Population, na.rm = TRUE), big.mark = ",")))
+}
+```
+
+## Population Density Categories
+
+```{r population-categories}
+# Chart Population Density vs COVID Cases
+county_summary <- county_summary %>%
+  mutate(
+    pop_density_category = case_when(
+      Population < 10000 ~ "Low (<10K)",
+      Population < 50000 ~ "Medium (10K-50K)",
+      Population < 200000 ~ "High (50K-200K)",
+      TRUE ~ "Very High (>200K)"
+    ),
+    pop_density_category = factor(pop_density_category, 
+                                  levels = c("Low (<10K)", "Medium (10K-50K)", 
+                                             "High (50K-200K)", "Very High (>200K)"))
+  )
+```
+
+```{r plot-density-impact}
+plot_density_impact <- county_summary %>%
+  ggplot(aes(x = pop_density_category, y = cases_per_capita, fill = pop_density_category)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_continuous(labels = comma_format()) +
+  labs(
+    title = "COVID-19 Cases per Capita by Population Density Category",
+    subtitle = "All counties with population > 0",
+    x = "Population Density Category",
+    y = "Cases per 100K Population",
+    fill = "Population Category"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(plot_density_impact)
+
+# It looks like the variation is very high for the counties with low population sizes
+# This is likely because it takes very few cases to skew the per capita results
+# For this reason the data will be filtered to > 5000 when I fit a linear model later
+```
+
+# Statistical Modeling
+
+## Simple Linear Model: Population vs Cases per 100K
+
+```{r model-data-prep}
+# Statistical Analysis: Per Capita Cases By Population Density
+model_data <- county_summary %>%
+  filter(Population > 5000) %>%  # Filtering to > 5,000 residents here
+  filter(!is.na(cases_per_capita), cases_per_capita > 0,
+         !is.na(Population), Population > 0)
+
+cat(sprintf("\nData for modeling (Population > 5,000): %d counties\n", nrow(model_data)))
+if(nrow(model_data) > 0) {
+  cat(sprintf("Population range for model: %s to %s\n", 
+              format(min(model_data$Population, na.rm = TRUE), big.mark = ","),
+              format(max(model_data$Population, na.rm = TRUE), big.mark = ",")))
+}
+```
+
+```{r linear-model}
+if(nrow(model_data) > 0 && all(is.finite(model_data$cases_per_capita))) {
+  # Create LM
+  simple_model <- lm(cases_per_capita ~ Population, data = model_data)
+  
+  print("Linear Model Summary: Cases per 100,000")
+  print(summary(simple_model))
+  
+  # Calculate R^2 & RSME
+  r_squared <- summary(simple_model)$r.squared
+  rmse <- sqrt(mean(simple_model$residuals^2))
+  cat(sprintf("R-squared: %.4f\n", r_squared))
+  cat(sprintf("RMSE: %.2f\n", rmse))
+  
+  # Add predictions to data
+  model_data <- model_data %>%
+    mutate(predicted_cases = predict(simple_model))
+}
+```
+
+## Model Visualization
+
+```{r model-plots}
+if(exists("simple_model")) {
+  # Visualization 3: Actual vs Predicted Cases - Simple Model
+  plot_simple_model <- model_data %>%
+    ggplot(aes(x = predicted_cases, y = cases_per_capita)) +
+    geom_point(alpha = 0.6, color = "steelblue", size = 2) +
+    geom_smooth(method = "lm", se = FALSE, color = "red", size = 1) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") +
+    labs(
+      title = "Actual vs Predicted COVID-19 Cases per 100K",
+      subtitle = paste("Simple linear model: Population only (R² =", 
+                       round(r_squared, 4), ") | Pop > 5K"),
+      x = "Predicted Cases per 100K",
+      y = "Actual Cases per 100K"
+    ) +
+    theme_minimal()
+  
+  print(plot_simple_model)
+}
+```
+
+## Model Results and Predictions
+
+```{r model-results}
+if(exists("simple_model")) {
+  # Print model equation & example predictions
+  intercept <- coef(simple_model)[1]
+  slope <- coef(simple_model)[2]
+  cat(sprintf("\nModel Equation: Cases per 100K = %.2f + %.6f × Population\n", 
+              intercept, slope))
+  
+  cat("\nExample Predictions:\n")
+  example_pops <- c(50000, 100000, 250000, 500000)
+  for(pop in example_pops) {
+    pred <- intercept + slope * pop
+    cat(sprintf("  Population %s: %.0f cases per 100K\n", 
+                format(pop, big.mark = ","), pred))
+  }
+}
+```
+
+# Conclusions
+
+The goal was to see if there was a relationship between population size and per capita cases. The most important statistic to look at here is the slope. Looking at the very small value for the slope (1.404489e-04) we can see that population size of a county had almost no effect on the per capita cases in the end. This can also be seen in the box plot as there was very little difference in the mean number of cases as the counties grew in size. Finally, changing the inputs of the prediction model did not lead to large swings in the outputs of the model.
+
+This goes against the claim that densely populated cities were more likely to spread covid on a per capita basis. This is likely because given the highly contagious nature of covid, everyone eventually ended up catching it at some point, regardless of if they lived in a city or a remote area.
+
+
+References:
+Assistance provided by Claude 4.5 Sonnet for generating code for charts, troubleshooting R Markdown knitting errors and fixing dataset connection issues. January 14, 2026.
